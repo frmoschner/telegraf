@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/gopcua/opcua"
-	"github.com/gopcua/opcua/id"
 	"github.com/gopcua/opcua/ua"
 
 	"github.com/influxdata/telegraf"
@@ -33,7 +32,6 @@ type subscribeClient struct {
 	eventItemsReqs     []*ua.MonitoredItemCreateRequest
 	dataNotifications  chan *opcua.PublishNotificationData
 	metrics            chan telegraf.Metric
-	eventMetrics       chan telegraf.Metric
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -95,13 +93,7 @@ func (sc *subscribeClientConfig) createSubscribeClient(log telegraf.Logger) (*su
 		return nil, err
 	}
 
-	monitoredItemsReqs, err := createMonitoredItems(client)
-	if err != nil {
-		return nil, err
-	}
-
-	eventItemsReqs, err := createEventItems(client)
-	if err != nil {
+	if err := client.InitEventNodeIDs(); err != nil {
 		return nil, err
 	}
 
@@ -110,8 +102,8 @@ func (sc *subscribeClientConfig) createSubscribeClient(log telegraf.Logger) (*su
 	subClient := &subscribeClient{
 		OpcUAInputClient:   client,
 		Config:             *sc,
-		monitoredItemsReqs: monitoredItemsReqs,
-		eventItemsReqs:     eventItemsReqs,
+		monitoredItemsReqs: make([]*ua.MonitoredItemCreateRequest, len(client.NodeIDs)),
+		eventItemsReqs:     make([]*ua.MonitoredItemCreateRequest, len(client.EventNodeMetricMapping)),
 		// 100 was chosen to make sure that the channels will not block when multiple changes come in at the same time.
 		// The channel size should be increased if reports come in on Telegraf blocking when many changes come in at
 		// the same time. It could be made dependent on the number of nodes subscribed to and the subscription interval.
@@ -121,141 +113,32 @@ func (sc *subscribeClientConfig) createSubscribeClient(log telegraf.Logger) (*su
 		cancel:            processingCancel,
 	}
 
-	return subClient, nil
-}
-
-func createMonitoredItems(client *input.OpcUAInputClient) ([]*ua.MonitoredItemCreateRequest, error) {
-	monitoredItems := make([]*ua.MonitoredItemCreateRequest, len(client.NodeIDs))
-
+	log.Debugf("Creating monitored items")
 	for i, nodeID := range client.NodeIDs {
 		// The node id index (i) is used as the handle for the monitored item
 		req := opcua.NewMonitoredItemCreateRequestWithDefaults(nodeID, ua.AttributeIDValue, uint32(i))
 		if err := assignConfigValuesToRequest(req, &client.NodeMetricMapping[i].Tag.MonitoringParams); err != nil {
 			return nil, err
 		}
-		monitoredItems[i] = req
+		subClient.monitoredItemsReqs[i] = req
 	}
 
-	return monitoredItems, nil
-}
-
-func createEventItems(client *input.OpcUAInputClient) ([]*ua.MonitoredItemCreateRequest, error) {
-	if client.EventStreamingInput == nil {
-		return nil, nil
-	}
-	if len(client.EventStreamingInput.NodeIDs) == 0 {
-		return nil, fmt.Errorf("no NodeIDs provided for event streaming")
-	}
-	filterExtObj, err := createEventFilter(client)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create event filter: %w", err)
-	}
-	eventItems := make([]*ua.MonitoredItemCreateRequest, len(client.EventStreamingInput.NodeIDs))
-	for i, nodeID := range client.EventStreamingInput.NodeIDs {
-		eventItems[i] = &ua.MonitoredItemCreateRequest{
-			ItemToMonitor: &ua.ReadValueID{
-				NodeID:       nodeID.ID,
-				AttributeID:  ua.AttributeIDEventNotifier,
-				DataEncoding: &ua.QualifiedName{},
-			},
-			MonitoringMode: ua.MonitoringModeReporting,
-			RequestedParameters: &ua.MonitoringParameters{
-				ClientHandle:     uint32(i),
-				SamplingInterval: 10000.0, // 10 Sekunden
-				QueueSize:        10,
-				DiscardOldest:    true,
-				Filter:           filterExtObj,
-			},
+	log.Debugf("Creating event streaming items")
+	client.EventClientHandle = make(map[uint32]input.EventNodeMetricMapping)
+	for i, node := range client.EventNodeMetricMapping {
+		req := opcua.NewMonitoredItemCreateRequestWithDefaults(node.NodeID, ua.AttributeIDValue, uint32(i))
+		if node.SamplingInterval > 0 {
+			req.RequestedParameters.SamplingInterval = float64(node.SamplingInterval)
 		}
-		client.ClientHandleToNodeID.Store(uint32(i), nodeID.ID.String())
-	}
-
-	return eventItems, nil
-}
-
-// Creation of event filter for event streaming
-func createEventFilter(client *input.OpcUAInputClient) (*ua.ExtensionObject, error) {
-	if client.EventStreamingInput == nil {
-		return nil, fmt.Errorf("EventStreamingInput is nil")
-	}
-
-	if (client.EventStreamingInput.EventType == input.NodeIDWrapper{}) || client.EventStreamingInput.EventType.ID == nil {
-		return nil, fmt.Errorf("invalid EventType or EventType.ID")
-	}
-
-	selects, err := createSelectClauses(client)
-	if err != nil {
-		return nil, err
-	}
-	return &ua.ExtensionObject{
-		EncodingMask: ua.ExtensionObjectBinary,
-		TypeID:       &ua.ExpandedNodeID{NodeID: ua.NewNumericNodeID(0, id.EventFilter_Encoding_DefaultBinary)},
-		Value: ua.EventFilter{
-			SelectClauses: selects,
-			WhereClause:   createWhereClauses(client),
-		},
-	}, nil
-}
-
-func createSelectClauses(client *input.OpcUAInputClient) ([]*ua.SimpleAttributeOperand, error) {
-	selects := make([]*ua.SimpleAttributeOperand, len(client.EventStreamingInput.Fields))
-	for i, name := range client.EventStreamingInput.Fields {
-		if name == "" {
-			return nil, fmt.Errorf("empty field name in fields stanza")
+		filterExtObj, err := node.CreateEventFilter()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create event filter: %w", err)
 		}
-		selects[i] = &ua.SimpleAttributeOperand{
-			TypeDefinitionID: ua.NewNumericNodeID(client.EventStreamingInput.EventType.ID.Namespace(), client.EventStreamingInput.EventType.ID.IntID()),
-			BrowsePath:       []*ua.QualifiedName{{NamespaceIndex: 0, Name: name}},
-			AttributeID:      ua.AttributeIDValue,
-		}
+		req.RequestedParameters.Filter = filterExtObj
+		client.EventClientHandle[uint32(i)] = node
+		subClient.eventItemsReqs[i] = req
 	}
-	return selects, nil
-}
-
-func createWhereClauses(client *input.OpcUAInputClient) *ua.ContentFilter {
-	if len(client.EventStreamingInput.SourceNames) == 0 {
-		return &ua.ContentFilter{
-			Elements: make([]*ua.ContentFilterElement, 0),
-		}
-	}
-	operands := make([]*ua.ExtensionObject, 0)
-	for _, sourceName := range client.EventStreamingInput.SourceNames {
-		literalOperand := &ua.ExtensionObject{
-			EncodingMask: 1,
-			TypeID: &ua.ExpandedNodeID{
-				NodeID: ua.NewNumericNodeID(0, id.LiteralOperand_Encoding_DefaultBinary),
-			},
-			Value: ua.LiteralOperand{
-				Value: ua.MustVariant(sourceName),
-			},
-		}
-		operands = append(operands, literalOperand)
-	}
-
-	attributeOperand := &ua.ExtensionObject{
-		EncodingMask: ua.ExtensionObjectBinary,
-		TypeID: &ua.ExpandedNodeID{
-			NodeID: ua.NewNumericNodeID(0, id.SimpleAttributeOperand_Encoding_DefaultBinary),
-		},
-		Value: &ua.SimpleAttributeOperand{
-			TypeDefinitionID: ua.NewNumericNodeID(client.EventStreamingInput.EventType.ID.Namespace(), client.EventStreamingInput.EventType.ID.IntID()),
-			BrowsePath: []*ua.QualifiedName{
-				{NamespaceIndex: 0, Name: "SourceName"},
-			},
-			AttributeID: ua.AttributeIDValue,
-		},
-	}
-
-	filterElement := &ua.ContentFilterElement{
-		FilterOperator: ua.FilterOperatorInList,
-		FilterOperands: append([]*ua.ExtensionObject{attributeOperand}, operands...),
-	}
-
-	wheres := &ua.ContentFilter{
-		Elements: []*ua.ContentFilterElement{filterElement},
-	}
-
-	return wheres
+	return subClient, nil
 }
 
 func (o *subscribeClient) connect() error {
@@ -292,52 +175,62 @@ func (o *subscribeClient) stop(ctx context.Context) <-chan struct{} {
 	return closing
 }
 
-func (o *subscribeClient) startStreamValues(ctx context.Context) (<-chan telegraf.Metric, error) {
+func (o *subscribeClient) startMonitoring(ctx context.Context) (<-chan telegraf.Metric, error) {
 	if len(o.monitoredItemsReqs) == 0 {
 		return nil, nil
 	}
-	resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, o.monitoredItemsReqs...)
+	// fixme: Two connection attempts are made if both values and events are streamed
+	err := o.connect()
 	if err != nil {
-		return nil, fmt.Errorf("failed to start monitoring items: %w", err)
+		switch o.Config.ConnectFailBehavior {
+		case "retry":
+			o.Log.Warnf("Failed to connect to OPC UA server %s. Will attempt to connect again at the next interval: %s", o.Config.Endpoint, err)
+			return nil, nil
+		case "ignore":
+			o.Log.Errorf("Failed to connect to OPC UA server %s. Will not retry: %s", o.Config.Endpoint, err)
+			return nil, nil
+		}
+		return nil, err
 	}
-	o.Log.Debug("Monitoring items")
 
-	for idx, res := range resp.Results {
-		if !o.StatusCodeOK(res.StatusCode) {
-			// Verify NodeIDs array has been built before trying to get item; otherwise show '?' for node id
-			if len(o.OpcUAInputClient.NodeIDs) > idx {
-				o.Log.Debugf("Failed to create monitored item for node %v (%v)",
-					o.OpcUAInputClient.NodeMetricMapping[idx].Tag.FieldName, o.OpcUAInputClient.NodeIDs[idx].String())
-			} else {
-				o.Log.Debugf("Failed to create monitored item for node %v (%v)", o.OpcUAInputClient.NodeMetricMapping[idx].Tag.FieldName, '?')
+	if len(o.monitoredItemsReqs) != 0 {
+		resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, o.monitoredItemsReqs...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to start monitoring items: %w", err)
+		}
+		o.Log.Debug("Monitoring items")
+
+		for idx, res := range resp.Results {
+			if !o.StatusCodeOK(res.StatusCode) {
+				// Verify NodeIDs array has been built before trying to get item; otherwise show '?' for node id
+				if len(o.OpcUAInputClient.NodeIDs) > idx {
+					o.Log.Debugf("Failed to create monitored item for node %v (%v)",
+						o.OpcUAInputClient.NodeMetricMapping[idx].Tag.FieldName, o.OpcUAInputClient.NodeIDs[idx].String())
+				} else {
+					o.Log.Debugf("Failed to create monitored item for node %v (%v)", o.OpcUAInputClient.NodeMetricMapping[idx].Tag.FieldName, '?')
+				}
+				return nil, fmt.Errorf("creating monitored item failed with status code: %w", res.StatusCode)
 			}
+		}
+	}
 
-			return nil, fmt.Errorf("creating monitored item failed with status code: %w", res.StatusCode)
+	if len(o.eventItemsReqs) != 0 {
+		resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, o.eventItemsReqs...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to start monitoring event stream: %w", err)
+		}
+		o.Log.Debug("Monitoring events")
+
+		for _, res := range resp.Results {
+			if !o.StatusCodeOK(res.StatusCode) {
+				return nil, fmt.Errorf("creating monitored event streaming item failed with status code: %w", res.StatusCode)
+			}
 		}
 	}
 
 	go o.processReceivedNotifications()
 
 	return o.metrics, nil
-}
-
-func (o *subscribeClient) startStreamEvents(ctx context.Context) (<-chan telegraf.Metric, error) {
-	resp, err := o.sub.Monitor(ctx, ua.TimestampsToReturnBoth, o.eventItemsReqs...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to start monitoring event stream: %w", err)
-	}
-	o.Log.Debug("Monitoring events")
-
-	for _, res := range resp.Results {
-		if !o.StatusCodeOK(res.StatusCode) {
-			return nil, fmt.Errorf("creating monitored event streaming item failed with status code: %w", res.StatusCode)
-		}
-	}
-
-	o.eventMetrics = make(chan telegraf.Metric, 100)
-	go o.processReceivedNotifications()
-
-	return o.eventMetrics, nil
 }
 
 func (o *subscribeClient) processReceivedNotifications() {
@@ -356,83 +249,56 @@ func (o *subscribeClient) processReceivedNotifications() {
 				o.Log.Error(res.Error)
 				continue
 			}
+			if res.Value == nil {
+				o.Log.Error("Received nil notification")
+				return
+			}
 
 			switch notif := res.Value.(type) {
 			case *ua.DataChangeNotification:
-				o.handleDataChange(notif)
+				o.Log.Debugf("Received data change notification with %d items", len(notif.MonitoredItems))
+				// It is assumed the notifications are ordered chronologically
+				for _, monitoredItemNotif := range notif.MonitoredItems {
+					i := int(monitoredItemNotif.ClientHandle)
+					oldValue := o.LastReceivedData[i].Value
+					o.UpdateNodeValue(i, monitoredItemNotif.Value)
+					o.Log.Debugf("Data change notification: node %q value changed from %v to %v",
+						o.NodeIDs[i].String(), oldValue, o.LastReceivedData[i].Value)
+					o.metrics <- o.MetricForNode(i)
+				}
 			case *ua.EventNotificationList:
-				o.handleEventNotification(notif)
+				o.Log.Debugf("Processing event notification with %d events", len(notif.Events))
+				for _, event := range notif.Events {
+					fields := make(map[string]interface{})
+					node := o.OpcUAInputClient.EventClientHandle[event.ClientHandle]
+					for i, field := range event.EventFields {
+						fieldName := node.Fields[i]
+						value := field.Value()
+
+						if value == nil {
+							o.Log.Warnf("Field %s has nil value", fieldName)
+							continue
+						}
+
+						if fieldName == "Message" {
+							if localizedText, ok := value.(*ua.LocalizedText); ok {
+								fields["Message"] = localizedText.Text
+							} else {
+								o.Log.Warnf("Message field is not of type *ua.LocalizedText: %T", value)
+							}
+							continue
+						}
+						fields[fieldName] = value
+					}
+					tags := map[string]string{
+						"node_id": node.NodeID.String(),
+						"source":  o.Config.Endpoint,
+					}
+					o.metrics <- metric.New("opcua_event", tags, fields, time.Now())
+				}
 			default:
 				o.Log.Warnf("Received notification has unexpected type %s", reflect.TypeOf(res.Value))
 			}
 		}
-	}
-}
-
-func (o *subscribeClient) handleDataChange(notif *ua.DataChangeNotification) {
-	o.Log.Debugf("Received data change notification with %d items", len(notif.MonitoredItems))
-	// It is assumed the notifications are ordered chronologically
-	for _, monitoredItemNotif := range notif.MonitoredItems {
-		i := int(monitoredItemNotif.ClientHandle)
-		oldValue := o.LastReceivedData[i].Value
-		o.UpdateNodeValue(i, monitoredItemNotif.Value)
-		o.Log.Debugf("Data change notification: node %q value changed from %v to %v",
-			o.NodeIDs[i].String(), oldValue, o.LastReceivedData[i].Value)
-		o.metrics <- o.MetricForNode(i)
-	}
-}
-
-func (o *subscribeClient) handleEventNotification(notif *ua.EventNotificationList) {
-	if notif == nil {
-		o.Log.Error("Received nil EventNotificationList")
-		return
-	}
-	o.Log.Debugf("Processing event notification with %d events", len(notif.Events))
-	if len(notif.Events) == 0 {
-		o.Log.Warn("Received an empty event notification list")
-		return
-	}
-	for _, event := range notif.Events {
-		fields := make(map[string]interface{})
-		for i, field := range event.EventFields {
-			fieldName := o.OpcUAInputClient.EventStreamingInput.Fields[i]
-			value := field.Value()
-
-			if value == nil {
-				o.Log.Warnf("Field %s has nil value", fieldName)
-				continue
-			}
-
-			if fieldName == "Message" {
-				if localizedText, ok := value.(*ua.LocalizedText); ok {
-					fields["Message"] = localizedText.Text
-				} else {
-					o.Log.Warnf("Message field is not of type *ua.LocalizedText: %T", value)
-				}
-				continue
-			}
-			var stringValue string
-			switch v := value.(type) {
-			case string:
-				stringValue = v
-			case fmt.Stringer:
-				stringValue = v.String()
-			default:
-				stringValue = fmt.Sprintf("%v", v)
-			}
-			fields[fieldName] = stringValue
-		}
-
-		nodeID, ok := o.ClientHandleToNodeID.Load(event.ClientHandle)
-		if !ok {
-			o.Log.Warnf("NodeId not found for ClientHandle: %d", event.ClientHandle)
-			nodeID = "unknown"
-		}
-		tags := map[string]string{
-			"node_id":    nodeID.(string),
-			"opcua_host": o.Config.Endpoint,
-		}
-		metric := metric.New("opcua_event_notification", tags, fields, time.Now())
-		o.eventMetrics <- metric
 	}
 }
