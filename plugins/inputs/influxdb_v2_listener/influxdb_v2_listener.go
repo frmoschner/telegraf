@@ -224,6 +224,7 @@ func (h *InfluxDBV2Listener) routes() error {
 	h.mux.Handle("/api/v2/write", authHandler(h.handleWrite()))
 	h.mux.Handle("/api/v2/ready", h.handleReady())
 	h.mux.Handle("/", authHandler(h.handleDefault()))
+	h.mux.Handle("/ping", http.HandlerFunc(h.handlePing()))
 
 	return nil
 }
@@ -252,6 +253,12 @@ func (h *InfluxDBV2Listener) handleDefault() http.HandlerFunc {
 	return func(res http.ResponseWriter, req *http.Request) {
 		defer h.notFoundsServed.Incr(1)
 		http.NotFound(res, req)
+	}
+}
+
+func (h *InfluxDBV2Listener) handlePing() http.HandlerFunc {
+	return func(res http.ResponseWriter, req *http.Request) {
+		res.WriteHeader(http.StatusNoContent)
 	}
 }
 
